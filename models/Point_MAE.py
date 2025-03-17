@@ -47,6 +47,7 @@ class Encoder(nn.Module):   ## Embedding module
         return feature_global.reshape(bs, g, self.encoder_channel)
 
 
+# TODO: Benchmark Runtime
 class Group(nn.Module):  # FPS + KNN
     def __init__(self, num_group, group_size):
         super().__init__()
@@ -153,7 +154,7 @@ class TransformerEncoder(nn.Module):
         
         self.blocks = nn.ModuleList([
             Block(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, 
                 drop=drop_rate, attn_drop=attn_drop_rate, 
                 drop_path = drop_path_rate[i] if isinstance(drop_path_rate, list) else drop_path_rate
                 )
@@ -540,9 +541,13 @@ class PointTransformer(nn.Module):
 
         x = torch.cat((cls_tokens, group_input_tokens), dim=1)
         pos = torch.cat((cls_pos, pos), dim=1)
+        
         # transformer
         x = self.blocks(x, pos)
         x = self.norm(x)
+        
+        # TODO: Benchmark different pooling methods. Current one seems limiting for physics modeling.
         concat_f = torch.cat([x[:, 0], x[:, 1:].max(1)[0]], dim=-1)
+        # TODO: Benchmark neural operators for better physics performance.
         ret = self.cls_head_finetune(concat_f)
         return ret

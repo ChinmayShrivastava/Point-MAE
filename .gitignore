@@ -7,3 +7,5 @@ best/
 dist/
 build/
 *.egg-info/
+
+venv/
