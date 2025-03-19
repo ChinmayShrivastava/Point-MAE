@@ -377,8 +377,23 @@ class Point_MAE(nn.Module):
         else:
             raise NotImplementedError
             # self.loss_func = emd().cuda()
-
-
+            
+    def encode_pts(self, pts):
+        """
+        Encode the point cloud into a set of tokens.
+        
+        Args:
+            pts: B N 3
+        Returns:
+            x_vis: B C
+        """
+        neighborhood, center = self.group_divider(pts)
+        x_vis, _ = self.MAE_encoder(neighborhood, center)
+        # perform max pooling over the group size so that the output is B C
+        # TODO: Benchmark different pooling methods. Current one might be limiting for physics modeling.
+        x_vis = torch.max(x_vis, dim=2)[0]
+        return x_vis
+    
     def forward(self, pts, vis = False, **kwargs):
         neighborhood, center = self.group_divider(pts)
 
@@ -420,7 +435,11 @@ class Point_MAE(nn.Module):
 # finetune model
 @MODELS.register_module()
 class PointTransformer(nn.Module):
-    def __init__(self, config, **kwargs):
+    def __init__(
+        self, 
+        config, 
+        **kwargs
+    ):
         super().__init__()
         self.config = config
 
@@ -473,6 +492,11 @@ class PointTransformer(nn.Module):
 
         trunc_normal_(self.cls_token, std=.02)
         trunc_normal_(self.cls_pos, std=.02)
+        
+        # PEFT
+        assert "k" in kwargs, "k must be provided"
+        self.k = kwargs["k"]
+        self.prompt
 
     def build_loss_func(self):
         self.loss_ce = nn.CrossEntropyLoss()
