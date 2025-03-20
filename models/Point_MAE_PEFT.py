@@ -1,16 +1,22 @@
+import random
+
+import numpy as np
+import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import timm
-from timm.models.layers import DropPath, trunc_normal_
-import numpy as np
-from .build import MODELS
-from utils import misc
-from utils.checkpoint import get_missing_parameters_message, get_unexpected_parameters_message
-from utils.logger import *
-import random
 from knn_cuda import KNN
+from timm.models.layers import DropPath, trunc_normal_
+
 from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
+from peft.adapter import LinearAdapter
+from segmentation.pointnet_util import index_points, square_distance
+from utils import misc
+from utils.checkpoint import (get_missing_parameters_message,
+                              get_unexpected_parameters_message)
+from utils.logger import *
+
+from .build import MODELS
 
 
 class Encoder(nn.Module):   ## Embedding module
@@ -164,8 +170,28 @@ class Attention(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+    def __init__(
+        self, 
+        dim, 
+        num_heads, 
+        mlp_ratio=4., 
+        qkv_bias=False, 
+        qk_scale=None, 
+        drop=0., 
+        attn_drop=0.,
+        drop_path=0., 
+        act_layer=nn.GELU, 
+        norm_layer=nn.LayerNorm,
+        peft=False,
+        bottleneck_dim=None,
+        prompt_prior_adapter_drop_rate=0.0,
+        geometric_adapter_drop_rate=0.0,
+        output_adapter_drop_rate=0.0,
+        num_tokens_k=10,
+        max_peft_depth=5,
+        geometric_adapter_scale=0.7,
+        pooling_scale=0.3
+    ):
         super().__init__()
         self.norm1 = norm_layer(dim)
 
@@ -178,28 +204,209 @@ class Block(nn.Module):
         self.attn = Attention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
         
-    def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x)))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        # PEFT
+        if peft:
+            self.prompt_prior_adapter = LinearAdapter(
+                dim,
+                bottleneck_dim=bottleneck_dim,
+                drop_rate=prompt_prior_adapter_drop_rate,
+                return_residual=True
+            )
+            
+            self.geometric_adapter = LinearAdapter(
+                dim,
+                bottleneck_dim=bottleneck_dim,
+                drop_rate=geometric_adapter_drop_rate,
+                return_residual=False
+            )
+            
+            self.output_adapter = LinearAdapter(
+                dim,
+                bottleneck_dim=bottleneck_dim,
+                drop_rate=output_adapter_drop_rate,
+                return_residual=True
+            )
+            
+            self.output_transform = nn.Sequential(
+                nn.Linear(dim, dim),
+                nn.BatchNorm1d(dim),
+                nn.GELU()
+            )
+            
+            self.prompt_dropout = nn.Dropout(0.1)
+            self.K = num_tokens_k
+            self.max_peft_depth = max_peft_depth
+            self.geometric_adapter_scale = geometric_adapter_scale
+            self.pooling_scale = pooling_scale
+            self.prompt_embedding_parameters = nn.Parameter(torch.zeros(self.K, dim))
+            trunc_normal_(self.prompt_embedding_parameters, std=.02)
+            
+    def pooling(self, knn_x_w):
+        # Feature Aggregation (Pooling)
+        lc_x = knn_x_w.max(dim=2)[0]
+        lc_x = self.out_transform(lc_x.permute(0, 2, 1)).permute(0,2,1)
+        return lc_x
+    
+    def propagate(self, xyz1, xyz2, points1, points2, de_neighbors):
+        """
+        Input:
+            xyz1: input points position data, [B, N, 3]
+            xyz2: sampled input points position data, [B, S, 3]
+            points1: input points data, [B, N, D']
+            points2: input points data, [B, S, D'']
+        Return:
+            new_points: upsampled points data, [B, N, D''']
+        """
+        B, N, _ = xyz1.shape
+        _, S, _ = xyz2.shape
+        dists = square_distance(xyz1, xyz2)
+        dists, idx = dists.sort(dim=-1)
+        dists, idx = dists[:, :, :de_neighbors], idx[:, :, :de_neighbors]  # [B, N, S]
+        dist_recip = 1.0 / (dists + 1e-8)
+        norm = torch.sum(dist_recip, dim=2, keepdim=True)
+        weight = dist_recip / norm
+        weight = weight.view(B, N, de_neighbors, 1)
+        interpolated_points = torch.sum(index_points(points2, idx) * weight, dim=2)#B, N, 6, C->B,N,C
+        new_points = points1+0.3*interpolated_points # B,N,C
+        return new_points
+        
+    def forward(
+        self, 
+        x,
+        mask=None,
+        center=None,
+        second_center=None,
+        second_idx=None,
+        second_center_idx=None,
+        second_group_size=None,
+        prompt_prior=None,
+        local_attention=None,
+        local_attention_norm=None,
+        layer_id=None
+    ):
+        
+        B, G, _ = x.shape
+        if mask is not None:
+            _, mask_dim, _ = mask.shape
+            mask_new = torch.zeros([B, mask_dim+self.K+1, mask_dim+self.K+1]).cuda()
+            mask_new[:, self.K+1:, self.K+1:] = mask
+            mask = mask_new
+            
+        if layer_id < self.max_peft_depth:
+            prompt = self.prompt_dropout(self.prompt_embeddings.repeat(B, 1, 1))
+            
+            if prompt_prior is not None:
+                adapted_prompt = self.prompt_prior_adapter(prompt_prior)
+                prompt = prompt + adapted_prompt
+                
+            x = torch.cat((x[:,0].unsqueeze(1), prompt, x[:,1:]), 1)
+            x = x + self.attn(self.norm1(x), prompt, mask)[0]
+            x_fn = self.drop_path(self.mlp(self.norm2(x)))
+            x = x + x_fn + self.geometric_adapter_scale * self.geometric_adapter(x_fn)
+            
+            prompt = x[:, 1:self.K+1]
+            x = torch.cat((x[:,0].unsqueeze(1), x[:, self.K+1:]), 1)
+            cls_x = x[:, 0]
+            x = x[:, 1:]
+            
+            prompt_x = torch.cat((prompt, x), dim=1)
+            
+            x_neighborhoods = prompt_x.reshape(B*G, -1)[second_idx, :]
+            x_neighborhoods = x_neighborhoods.reshape(B*second_center.shape[1], second_group_size, -1)
+            x_centers = prompt_x.reshape(B*G, -1)[second_center_idx, :]
+            x_centers = x_centers.reshape(B, second_center.shape[1], -1)
+            
+            x_neighborhoods = x_neighborhoods.clone() + self.drop_path(local_attention(local_attention_norm(x_neighborhoods.clone())))
+            
+            vis_x = self.pooling(x_neighborhoods.reshape(B, second_center.shape[1], second_group_size, -1))
+            vis_x = vis_x + self.pooling_scale * x_centers
+            
+            # TODO: Replace algorithmic propagation with learned propagation layer
+            # Current propagation uses fixed geometric rules
+            # Could use a learned MLP or attention mechanism to propagate features
+            # between points in a data-driven way
+            x = self.propagate(xyz1=center, xyz2=second_center, points1=x, points2=vis_x, 
+                            de_neighbors=second_center.shape[1])
+            
+            x = torch.cat((cls_x.unsqueeze(1), prompt, x), 1)
+            x = self.output_adapter(x)
+            
+            # Remove prompt tokens
+            x = torch.cat((x[:,0].unsqueeze(1), x[:, self.K+1:]), 1)
+        else:
+            x = x + self.attn(self.norm1(x), mask)[0]
+            x_fn = self.drop_path(self.mlp(self.norm2(x)))
+            x = x + x_fn + self.geometric_adapter_scale * self.geometric_adapter(x_fn)
+            cls_x = x[:,0]
+            x = x[:,1:]
+            G = G-1
+            
+            x_neighborhoods = x.reshape(B*G, -1)[second_idx, :].reshape(B*second_center.shape[1], second_group_size, -1)
+            x_centers = x.reshape(B*G, -1)[second_center_idx, :].reshape(B, second_center.shape[1], -1)
+            
+            x_neighborhoods = x_neighborhoods.clone() + self.drop_path(local_attention(local_attention_norm(x_neighborhoods.clone())))
+            
+            vis_x = self.pooling(x_neighborhoods.reshape(B, second_center.shape[1], second_group_size, -1)) + self.pooling_scale * x_centers
+            x = self.propagate(xyz1=center, xyz2=second_center, points1=x, points2=vis_x, de_neighbors=second_center.shape[1])
+            
+            x = torch.cat((cls_x.unsqueeze(1), x), 1)
+            x = self.output_adapter(x)
         return x
 
 
 class TransformerEncoder(nn.Module):
     def __init__(self, embed_dim=768, depth=4, num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None,
-                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.):
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0., peft=False, bottleneck_dim=None, 
+                 prompt_prior_adapter_drop_rate=0.0, geometric_adapter_drop_rate=0.0, output_adapter_drop_rate=0.0, 
+                 num_tokens_k=10, max_peft_depth=5, geometric_adapter_scale=0.7, pooling_scale=0.3):
         super().__init__()
         
         self.blocks = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, 
                 drop=drop_rate, attn_drop=attn_drop_rate, 
-                drop_path = drop_path_rate[i] if isinstance(drop_path_rate, list) else drop_path_rate
+                drop_path = drop_path_rate[i] if isinstance(drop_path_rate, list) else drop_path_rate,
+                peft=peft,
+                bottleneck_dim=bottleneck_dim,
+                prompt_prior_adapter_drop_rate=prompt_prior_adapter_drop_rate,
+                geometric_adapter_drop_rate=geometric_adapter_drop_rate,
+                output_adapter_drop_rate=output_adapter_drop_rate,
+                num_tokens_k=num_tokens_k,
+                max_peft_depth=max_peft_depth,
+                geometric_adapter_scale=geometric_adapter_scale,
+                pooling_scale=pooling_scale
                 )
             for i in range(depth)])
 
-    def forward(self, x, pos):
+    def forward(
+        self, 
+        x, 
+        pos,
+        mask=None,
+        center=None,
+        second_center=None,
+        second_idx=None,
+        second_center_idx=None,
+        second_group_size=None,
+        prompt_prior=None,
+        local_attention=None,
+        local_attention_norm=None,
+        layer_id=None
+    ):
         for _, block in enumerate(self.blocks):
-            x = block(x + pos)
+            x = block(
+                x + pos,
+                mask=mask,
+                center=center,
+                second_center=second_center,
+                second_idx=second_idx,
+                second_center_idx=second_center_idx,
+                second_group_size=second_group_size,
+                prompt_prior=prompt_prior,
+                local_attention=local_attention,
+                local_attention_norm=local_attention_norm,
+                layer_id=layer_id
+            )
         return x
 
 
@@ -504,11 +711,39 @@ class PointTransformer(nn.Module):
         )
 
         dpr = [x.item() for x in torch.linspace(0, self.drop_path_rate, self.depth)]
+        
+        # TODO: Move PEFT hyperparameters to config
+        # Should define in config:
+        # - bottleneck_dim: Dimension of bottleneck adapters
+        # - prompt_prior_adapter_drop_rate: Dropout rate for prompt prior adapter
+        # - geometric_adapter_drop_rate: Dropout rate for geometric adapter
+        # - output_adapter_drop_rate: Dropout rate for output adapter
+        # - num_tokens_k: Number of prompt tokens
+        # - max_peft_depth: Maximum depth for PEFT layers
+        # - geometric_adapter_scale: Scale factor for geometric adapter
+        # - pooling_scale: Scale factor for pooling
+        self.bottleneck_dim = 64
+        self.prompt_prior_adapter_drop_rate = 0.1
+        self.geometric_adapter_drop_rate = 0.1
+        self.output_adapter_drop_rate = 0.1
+        self.num_tokens_k = 10
+        self.max_peft_depth = 5
+        self.geometric_adapter_scale = 0.7
+        self.pooling_scale = 0.3
         self.blocks = TransformerEncoder(
             embed_dim=self.trans_dim,
             depth=self.depth,
             drop_path_rate=dpr,
             num_heads=self.num_heads,
+            peft=True,
+            bottleneck_dim=self.bottleneck_dim,
+            prompt_prior_adapter_drop_rate=self.prompt_prior_adapter_drop_rate,
+            geometric_adapter_drop_rate=self.geometric_adapter_drop_rate,
+            output_adapter_drop_rate=self.output_adapter_drop_rate,
+            num_tokens_k=self.num_tokens_k,
+            max_peft_depth=self.max_peft_depth,
+            geometric_adapter_scale=self.geometric_adapter_scale,
+            pooling_scale=self.pooling_scale
         )
 
         self.norm = nn.LayerNorm(self.trans_dim)
@@ -539,6 +774,8 @@ class PointTransformer(nn.Module):
         
         assert "prompt_encoder" in kwargs, "prompt_encoder must be provided"
         self.prompt_encoder = kwargs["prompt_encoder"]
+        
+        self.second_group_divider = Group(num_group=self.num_group // 2, group_size=self.group_size // 2)
 
     def build_loss_func(self):
         self.loss_ce = nn.CrossEntropyLoss()
@@ -647,10 +884,27 @@ class PointTransformer(nn.Module):
         
         # PEFT
         prompt_prior = self.build_prompt_prior(pts)
+        # second hierarchy
+        _, \
+            second_center, \
+            second_idx, \
+            second_center_idx = self.second_group_divider(pts, return_idx=True)
         ###
         
         # transformer
-        x = self.blocks(x, pos)
+        x = self.blocks(
+            x, 
+            pos,
+            mask=None,
+            center=center,
+            second_center=second_center,
+            second_idx=second_idx,
+            second_center_idx=second_center_idx,
+            prompt_prior=prompt_prior,
+            local_attention=None,
+            local_attention_norm=None,
+            layer_id=None
+        )
         x = self.norm(x)
         
         # TODO: Benchmark different pooling methods. Current one seems limiting for physics modeling.

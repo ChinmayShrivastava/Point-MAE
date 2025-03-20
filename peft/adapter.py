@@ -7,14 +7,14 @@ class QuickGELU(nn.Module):
     def forward(self, x: torch.Tensor):
         return x * torch.sigmoid(1.702 * x)
 
-class Adapter(nn.Module):
+class LinearAdapter(nn.Module):
     def __init__(self,
         embed_dim,
         bottleneck_dim,
         drop_rate=0,
         return_residual=True
     ):
-        super(Adapter, self).__init__()
+        super(LinearAdapter, self).__init__()
     
         self.embed_dim = embed_dim
         self.bottleneck_dim = bottleneck_dim
