@@ -55,16 +55,18 @@ class Group(nn.Module):  # FPS + KNN
         self.group_size = group_size
         self.knn = KNN(k=self.group_size, transpose_mode=True)
 
-    def forward(self, xyz):
+    def forward(self, xyz, return_idx=False):
         '''
             input: B N 3
             ---------------------------
             output: B G M 3
             center : B G 3
+            idx : B G M
+            center_idx : B G
         '''
         batch_size, num_points, _ = xyz.shape
         # fps the centers out
-        center = misc.fps(xyz, self.num_group) # B G 3
+        center, center_idx = misc.fps(xyz, self.num_group, return_idx=True) # B G 3, B G
         # knn to get the neighborhood
         _, idx = self.knn(xyz, center) # B G M
         assert idx.size(1) == self.num_group
@@ -76,7 +78,10 @@ class Group(nn.Module):  # FPS + KNN
         neighborhood = neighborhood.view(batch_size, self.num_group, self.group_size, 3).contiguous()
         # normalize
         neighborhood = neighborhood - center.unsqueeze(2)
-        return neighborhood, center
+        if return_idx:
+            return neighborhood, center, idx.view(batch_size, self.num_group, self.group_size), center_idx
+        else:
+            return neighborhood, center
 
 
 ## Transformers
@@ -639,6 +644,10 @@ class PointTransformer(nn.Module):
 
         x = torch.cat((cls_tokens, group_input_tokens), dim=1)
         pos = torch.cat((cls_pos, pos), dim=1)
+        
+        # PEFT
+        prompt_prior = self.build_prompt_prior(pts)
+        ###
         
         # transformer
         x = self.blocks(x, pos)
