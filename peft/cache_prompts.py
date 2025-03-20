@@ -97,3 +97,57 @@ def load_cached_data(cache_path, collection_name='encoded_data') -> Collection:
         return collection
     except ValueError:
         raise ValueError(f"Collection '{collection_name}' not found in ChromaDB at {cache_path}")
+
+def main():
+    """CLI function to cache prompt embeddings from a dataset into ChromaDB"""
+    import argparse
+    import os
+    import torch
+    from torch.utils.data import DataLoader
+    
+    parser = argparse.ArgumentParser(description='Cache prompt embeddings from dataset')
+    parser.add_argument('--model_path', type=str, required=True,
+                      help='Path to pretrained model checkpoint')
+    parser.add_argument('--data_path', type=str, required=True,
+                      help='Path to dataset')
+    parser.add_argument('--output_path', type=str, required=True,
+                      help='Output directory for ChromaDB storage')
+    parser.add_argument('--batch_size', type=int, default=32,
+                      help='Batch size for encoding')
+    parser.add_argument('--num_workers', type=int, default=4,
+                      help='Number of workers for data loading')
+    parser.add_argument('--device', type=str, default='cuda',
+                      help='Device to use for encoding (cuda/cpu)')
+    
+    args = parser.parse_args()
+
+    # Create output directory if it doesn't exist
+    os.makedirs(args.output_path, exist_ok=True)
+
+    # Load model
+    model = Point_MAE_PEFT.load_from_checkpoint(args.model_path)
+    model = model.to(args.device)
+    model.eval()
+
+    # Initialize dataset and dataloader
+    # Note: Modify this according to your specific dataset class
+    dataset = YourDataset(args.data_path)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers
+    )
+
+    # Initialize ChromaDB
+    client = PersistentClient(path=args.output_path)
+    collection = client.create_collection(
+        name="encoded_data",
+        metadata={"description": "Cached prompt embeddings"}
+    )
+
+    # Cache the embeddings
+    cache_embeddings(model, dataloader, collection, args.device, args.output_path)
+
+if __name__ == "__main__":
+    main()
