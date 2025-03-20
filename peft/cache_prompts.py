@@ -1,12 +1,33 @@
 import os
+from typing import List, Union
 
+import numpy as np
 import torch
+from chromadb import Collection, PersistentClient
 from tqdm import tqdm
 
 from models.Point_MAE_PEFT import Point_MAE
 
+# class PointMAEEmbeddingFunction(EmbeddingFunction):
+#     def __init__(self, model: Point_MAE): self.model = model
+    
+#     def __call__(self, input: Documents) -> List[List[float]]:
+#         # Process input through model to get embeddings
+#         with torch.no_grad():
+#             embeddings = self.model.encode_pts(input)
+        
+#         # Convert torch tensor to list of numpy arrays
+#         if isinstance(embeddings, torch.Tensor):
+#             return embeddings.cpu().numpy().tolist()
+#         return embeddings
 
-def cache_encoded_data(dataloader, model_path, output_path, device='cuda'):
+def cache_encoded_data(
+    dataloader, 
+    model_path, 
+    output_path, 
+    device='cuda',
+    collection_name='encoded_data'
+):
     """
     Load pretrained PointTransformer model and encode data from dataloader.
     Save encoded representations to a .pt file.
@@ -25,48 +46,54 @@ def cache_encoded_data(dataloader, model_path, output_path, device='cuda'):
     model.eval()
 
     # Create storage for encoded data
-    encoded_data = []
+    client = PersistentClient(path=output_path)
+    collection = client.get_or_create_collection(collection_name)
     
-    # Encode each batch
+    # Encode each batch and add to ChromaDB
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Encoding data"):
+        for i, batch in enumerate(tqdm(dataloader, desc="Encoding data")):
             # Assuming batch contains point cloud data
             # Modify according to your dataloader format
             points = batch.to(device)
             
             # Encode points
             encoded = model.encode_pts(points)
-            encoded_data.append(encoded.cpu())
             
-    # Concatenate all batches
-    encoded_data = torch.cat(encoded_data, dim=0)
+            # Convert to numpy and add to ChromaDB
+            embeddings = encoded.cpu().numpy()
+            ids = [f"point_cloud_{i}_{j}" for j in range(len(embeddings))]
+            
+            # Add embeddings to collection
+            collection.add(
+                embeddings=embeddings,
+                ids=ids,
+                metadatas=[{"batch_idx": i, "point_idx": j} for j in range(len(embeddings))]
+            )
     
-    # Save encoded data
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    torch.save(encoded_data, output_path)
-    print(f"Saved encoded data to {output_path}")
+    print(f"Saved encoded data to ChromaDB collection at {output_path}")
 
 
-def load_cached_data(cache_path):
+def load_cached_data(cache_path, collection_name='encoded_data') -> Collection:
     """
-    Load cached encoded data into a tensor of shape [N, D].
+    Load cached encoded data from a ChromaDB collection.
     
     Args:
-        cache_path: Path to the cached data file (.pt)
+        cache_path: Path to the ChromaDB persistent storage directory
+        collection_name: Name of the collection to load (default: 'encoded_data')
         
     Returns:
-        torch.Tensor: Loaded data with shape [N, D] where N is the total number
-                     of elements and D is the encoding dimension
+        collection: ChromaDB collection object containing the encoded data
     """
     if not os.path.exists(cache_path):
-        raise FileNotFoundError(f"Cache file not found at {cache_path}")
+        raise FileNotFoundError(f"ChromaDB directory not found at {cache_path}")
     
-    # Load cached data
-    cached_data = torch.load(cache_path)
-    
-    # Ensure proper shape
-    if cached_data.dim() != 2:
-        raise ValueError(f"Expected 2D tensor, got shape: {cached_data.shape}")
-    
-    print(f"Loaded cached data with shape: {cached_data.shape}")
-    return cached_data
+    # Load collection from ChromaDB
+    client = PersistentClient(path=cache_path)
+    try:
+        collection = client.get_collection(collection_name)
+        # Get collection info to print some statistics
+        count = collection.count()
+        print(f"Loaded ChromaDB collection '{collection_name}' with {count} entries")
+        return collection
+    except ValueError:
+        raise ValueError(f"Collection '{collection_name}' not found in ChromaDB at {cache_path}")
