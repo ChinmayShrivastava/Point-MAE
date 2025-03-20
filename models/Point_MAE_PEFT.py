@@ -100,27 +100,59 @@ class Mlp(nn.Module):
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(
+        self, 
+        dim,
+        bottleneck_dim=None,
+        num_heads=8, 
+        qkv_bias=False, 
+        qk_scale=None, 
+        attn_drop=0., 
+        proj_drop=0.,
+    ):
         super().__init__()
         self.num_heads = num_heads
-        head_dim = dim // num_heads
-        # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
-        self.scale = qk_scale or head_dim ** -0.5
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.bottleneck_dim = bottleneck_dim
+        
+        if bottleneck_dim is None:
+            # Standard attention
+            head_dim = dim // num_heads
+            self.scale = qk_scale or head_dim ** -0.5
+            self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+            self.proj = nn.Linear(dim, dim)
+        else:
+            # Bottlenecked attention
+            self.scale = qk_scale or bottleneck_dim ** -0.5
+            self.qkv = nn.Linear(dim, bottleneck_dim * 3, bias=qkv_bias)
+            self.proj = nn.Linear(bottleneck_dim, dim)
+            
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
     def forward(self, x):
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
+        
+        if self.bottleneck_dim is None:
+            # Standard attention path
+            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+            
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        else:
+            # Bottlenecked attention path
+            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.bottleneck_dim // self.num_heads).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+
+            x = (attn @ v).transpose(1, 2).reshape(B, N, self.bottleneck_dim)
+            
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
@@ -496,7 +528,12 @@ class PointTransformer(nn.Module):
         # PEFT
         assert "k" in kwargs, "k must be provided"
         self.k = kwargs["k"]
-        self.prompt
+        
+        assert "prompt_bank" in kwargs, "prompt_bank must be provided"
+        self.prompt_bank = kwargs["prompt_bank"]
+        
+        assert "prompt_encoder" in kwargs, "prompt_encoder must be provided"
+        self.prompt_encoder = kwargs["prompt_encoder"]
 
     def build_loss_func(self):
         self.loss_ce = nn.CrossEntropyLoss()
@@ -552,9 +589,46 @@ class PointTransformer(nn.Module):
             trunc_normal_(m.weight, std=.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
+    
+    def build_prompt_prior(
+        self,
+        pts
+    ):
+        # Encode input points into features
+        features = self.encode_pts(pts)
+        
+        # Query Chroma DB to find top K similar prompts
+        results = self.prompt_bank.query(
+            embeddings=features.detach().cpu().numpy(),
+            n_results=self.k-2 # as implemented in the paper
+        )
+        
+        # Get the embeddings from results
+        prompt_embeddings = torch.tensor(results['embeddings']).to(pts.device)  # Shape: [K-2, embedding_dim]
+        similarity_scores = torch.tensor(results['distances']).unsqueeze(0).to(pts.device)  # Shape: [1, K-2]
+        
+        # Matrix multiply similarity scores with prompt embeddings
+        # similarity_scores: [1, K-2], prompt_embeddings: [K-2, embedding_dim]
+        # Output shape: [1, embedding_dim]
+        weighted_prompts = torch.matmul(similarity_scores, prompt_embeddings)
+        
+        # Expand features to match batch dimension
+        features = features.unsqueeze(1)  # Shape: [B, 1, embedding_dim]
+        weighted_prompts = weighted_prompts.unsqueeze(1)  # Shape: [B, 1, embedding_dim]
+        prompt_embeddings = prompt_embeddings.unsqueeze(0).expand(features.size(0), -1, -1)  # Shape: [B, K-2, embedding_dim]
+        
+        # Concatenate along K dimension
+        # features: [B, 1, embedding_dim]
+        # weighted_prompts: [B, 1, embedding_dim] 
+        # prompt_embeddings: [B, K-2, embedding_dim]
+        # Final shape: [B, K, embedding_dim] 
+        prompt_features = torch.cat([features, weighted_prompts, prompt_embeddings], dim=1)
+        return prompt_features
 
-    def forward(self, pts):
-
+    def forward(
+        self, 
+        pts
+    ):
         neighborhood, center = self.group_divider(pts)
         group_input_tokens = self.encoder(neighborhood)  # B G N
 
