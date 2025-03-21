@@ -377,7 +377,19 @@ class TransformerEncoder(nn.Module):
                 pooling_scale=pooling_scale
                 )
             for i in range(depth)])
-
+        
+        self.local_attention = Attention(
+            dim=embed_dim,
+            bottleneck_dim=bottleneck_dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            qk_scale=qk_scale,
+            attn_drop=attn_drop_rate,
+            proj_drop=drop_rate
+        )
+        
+        self.local_attention_norm = nn.LayerNorm(embed_dim)
+        
     def forward(
         self, 
         x, 
@@ -389,8 +401,6 @@ class TransformerEncoder(nn.Module):
         second_center_idx=None,
         second_group_size=None,
         prompt_prior=None,
-        local_attention=None,
-        local_attention_norm=None,
         layer_id=None
     ):
         for _, block in enumerate(self.blocks):
@@ -403,8 +413,8 @@ class TransformerEncoder(nn.Module):
                 second_center_idx=second_center_idx,
                 second_group_size=second_group_size,
                 prompt_prior=prompt_prior,
-                local_attention=local_attention,
-                local_attention_norm=local_attention_norm,
+                local_attention=self.local_attention,
+                local_attention_norm=self.local_attention_norm,
                 layer_id=layer_id
             )
         return x
@@ -749,16 +759,16 @@ class PointTransformer(nn.Module):
         self.norm = nn.LayerNorm(self.trans_dim)
 
         self.cls_head_finetune = nn.Sequential(
-                nn.Linear(self.trans_dim * 2, 256),
-                nn.BatchNorm1d(256),
-                nn.ReLU(inplace=True),
-                nn.Dropout(0.5),
-                nn.Linear(256, 256),
-                nn.BatchNorm1d(256),
-                nn.ReLU(inplace=True),
-                nn.Dropout(0.5),
-                nn.Linear(256, self.cls_dim)
-            )
+            nn.Linear(self.trans_dim * 2, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(256, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.5),
+            nn.Linear(256, self.cls_dim)
+        )
 
         self.build_loss_func()
 
@@ -775,7 +785,11 @@ class PointTransformer(nn.Module):
         assert "prompt_encoder" in kwargs, "prompt_encoder must be provided"
         self.prompt_encoder = kwargs["prompt_encoder"]
         
-        self.second_group_divider = Group(num_group=self.num_group // 2, group_size=self.group_size // 2)
+        self.second_group_divider = Group(
+            num_group=self.num_group // 2, group_size=self.group_size // 2)
+        
+    def prepare_for_peft(self):
+        self = prepare_for_peft(self)
 
     def build_loss_func(self):
         self.loss_ce = nn.CrossEntropyLoss()
@@ -901,8 +915,6 @@ class PointTransformer(nn.Module):
             second_idx=second_idx,
             second_center_idx=second_center_idx,
             prompt_prior=prompt_prior,
-            local_attention=None,
-            local_attention_norm=None,
             layer_id=None
         )
         x = self.norm(x)
@@ -912,3 +924,27 @@ class PointTransformer(nn.Module):
         # TODO: Benchmark neural operators for better physics performance.
         ret = self.cls_head_finetune(concat_f)
         return ret
+
+def prepare_for_peft(
+    model: PointTransformer
+):
+    # freeze all parameters
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    # unfreeze the prompt prior
+    model.cls_head_finetune.requires_grad = True
+    
+    # unfreeze the prompt prior
+    model.blocks.local_attention.requires_grad = True
+    model.blocks.local_attention_norm.requires_grad = True
+    
+    for block in model.blocks.blocks:
+        block.prompt_prior.requires_grad = True
+        block.geometric_adapter.requires_grad = True
+        block.output_adapter.requires_grad = True
+        block.output_transform.requires_grad = True
+        block.prompt_embedding_parameters.requires_grad = True
+    
+    return model
+    

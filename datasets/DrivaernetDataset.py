@@ -2,8 +2,9 @@ import sqlite3
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 
+import pandas as pd
 
 class DrivAerNetSQLDataset(Dataset):
     """Dataset class for loading point clouds from SQLite database"""
@@ -59,3 +60,68 @@ class DrivAerNetSQLDataset(Dataset):
         point_cloud = torch.from_numpy(point_cloud_array).permute(1, 0)  # Shape: (4, num_points)
         
         return point_cloud
+    
+def get_dataloaders(
+    db_path: str,
+    batch_size: int,
+    num_workers: int
+) -> tuple:
+    """
+    Prepare and return the training, validation, and test DataLoader objects.
+
+    Args:
+        db_path (str): Path to SQLite database containing point clouds
+        batch_size (int): The number of samples per batch to load
+        num_workers (int): Number of worker processes for data loading
+
+    Returns:
+        tuple: A tuple containing the training DataLoader, validation DataLoader, and test DataLoader
+    """
+    full_dataset = DrivAerNetSQLDataset(db_path=db_path)
+    
+    train_ids = pd.read_csv('train_design_ids.txt', header=None).values.flatten()
+    val_ids = pd.read_csv('val_design_ids.txt', header=None).values.flatten()
+    test_ids = pd.read_csv('test_design_ids.txt', header=None).values.flatten()
+    
+    train_dataset = Subset(full_dataset, train_ids)
+    val_dataset = Subset(full_dataset, val_ids)
+    test_dataset = Subset(full_dataset, test_ids)
+    
+    def worker_init_fn(worker_id):
+        torch.cuda.empty_cache()
+    
+    # Optimize DataLoader settings for memory efficiency
+    dataloader_kwargs = {
+        'batch_size': batch_size,
+        'num_workers': num_workers,
+        'pin_memory': False,
+        'persistent_workers': False,
+        'prefetch_factor': 1,          # Reduced from 2 to 1
+        'drop_last': True,
+        'worker_init_fn': worker_init_fn  # Add worker initialization function
+    }
+
+        
+    # Reduce batch size if needed
+    if batch_size > 8:  # Adjust this threshold based on your GPU
+        print(f"Warning: Large batch size ({batch_size}) may cause OOM errors. Consider reducing it.")
+    
+    train_dataloader = DataLoader(
+        train_dataset, 
+        shuffle=True, 
+        **dataloader_kwargs
+    )
+    
+    val_dataloader = DataLoader(
+        val_dataset, 
+        shuffle=False, 
+        **dataloader_kwargs
+    )
+    
+    test_dataloader = DataLoader(
+        test_dataset, 
+        shuffle=False, 
+        **dataloader_kwargs
+    )
+    
+    return train_dataloader, val_dataloader, test_dataloader
