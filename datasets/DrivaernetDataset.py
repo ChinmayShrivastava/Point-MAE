@@ -33,18 +33,18 @@ class DrivAerNetSQLDataset(Dataset):
         # Load point cloud from database
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT data FROM point_clouds WHERE id=?", (idx,))
+            cursor.execute("SELECT id, data FROM point_clouds WHERE id=?", (idx,))
             result = cursor.fetchone()
             
             if result is None:
                 # Fallback: get the first available point cloud instead of raising an error
                 print(f"Warning: No data found for index {idx}, using fallback data")
-                cursor.execute("SELECT data FROM point_clouds LIMIT 1")
+                cursor.execute("SELECT id, data FROM point_clouds LIMIT 1")
                 result = cursor.fetchone()
                 if result is None:
                     raise RuntimeError("Database appears to be empty")
                     
-            binary_data = result[0]
+            point_id, binary_data = result
             
         # Convert binary data to tensor (already normalized)
         point_cloud_array = np.frombuffer(binary_data, dtype=np.float32).reshape(8192, 4)
@@ -57,9 +57,10 @@ class DrivAerNetSQLDataset(Dataset):
             sample_indices = np.random.choice(8192, self.num_points, replace=False)
             point_cloud_array = point_cloud_array[sample_indices]
         
-        # point_cloud = torch.from_numpy(point_cloud_array).permute(1, 0)  # Shape: (4, num_points)
-        
-        return point_cloud_array # Shape: (num_points, 4)
+        return {
+            'id': point_id,
+            'points': point_cloud_array  # Shape: (num_points, 4)
+        }
     
 def get_dataloaders(
     db_path: str,

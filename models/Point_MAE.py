@@ -375,20 +375,25 @@ class Point_MAE(nn.Module):
         self.build_loss_func(self.loss)
         
     def encode_pts(self, pts):
-        """
-        Encode the point cloud into a set of tokens.
-        
-        Args:
-            pts: B N 3
-        Returns:
-            x_vis: B C
-        """
         neighborhood, center = self.group_divider(pts)
-        x_vis, _ = self.MAE_encoder(neighborhood, center)
-        # perform max pooling over the group size so that the output is B C
-        # TODO: Benchmark different pooling methods. Current one might be limiting for physics modeling.
-        x_vis = torch.max(x_vis, dim=2)[0]
-        return x_vis
+        print("After group_divider:", neighborhood.shape, center.shape)
+        
+        # Use the encoder directly without masking
+        group_input_tokens = self.MAE_encoder.encoder(neighborhood)
+        print("After encoding:", group_input_tokens.shape)
+        
+        # Apply positional embedding
+        pos = self.MAE_encoder.pos_embed(center)
+        
+        # Apply transformer blocks
+        x = self.MAE_encoder.blocks(group_input_tokens, pos)
+        x = self.MAE_encoder.norm(x)
+        print("After transformer:", x.shape)
+        
+        # Pool over groups
+        x = torch.max(x, dim=1)[0]
+        print("After max pooling:", x.shape)
+        return x
 
     def build_loss_func(self, loss_type):
         if loss_type == "cdl1":

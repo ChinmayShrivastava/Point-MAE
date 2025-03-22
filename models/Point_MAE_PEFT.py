@@ -758,16 +758,20 @@ class PointTransformer_PEFT(nn.Module):
 
         self.norm = nn.LayerNorm(self.trans_dim)
 
-        self.cls_head_finetune = nn.Sequential(
-            nn.Linear(self.trans_dim * 2, 256),
-            nn.BatchNorm1d(256),
+        self.finetune_head = nn.Sequential(
+            nn.Linear(self.trans_dim * 2, 512),
+            nn.BatchNorm1d(512),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(256, 256),
-            nn.BatchNorm1d(256),
+            nn.Linear(512, 1024),
+            nn.BatchNorm1d(1024),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(256, self.cls_dim)
+            nn.Linear(1024, 2048),
+            nn.BatchNorm1d(2048),
+            nn.ReLU(inplace=True),
+            nn.Linear(2048, 4096),
+            nn.BatchNorm1d(4096),
+            nn.ReLU(inplace=True),
+            nn.Linear(4096, 8192)
         )
 
         self.build_loss_func()
@@ -787,6 +791,9 @@ class PointTransformer_PEFT(nn.Module):
         
         self.second_group_divider = Group(
             num_group=self.num_group // 2, group_size=self.group_size // 2)
+        
+        assert "embedding_model" in kwargs, "embedding_model must be provided"
+        self.embedding_model = kwargs["embedding_model"]
         
     def prepare_for_peft(self):
         self = prepare_for_peft(self)
@@ -851,12 +858,13 @@ class PointTransformer_PEFT(nn.Module):
         pts
     ):
         # Encode input points into features
-        features = self.encode_pts(pts)
+        features = self.embedding_model.encode_pts(pts)
         
         # Query Chroma DB to find top K similar prompts
         results = self.prompt_bank.query(
-            embeddings=features.detach().cpu().numpy(),
-            n_results=self.k-2 # as implemented in the paper
+            query_embeddings=features.detach().cpu().numpy(),
+            n_results=self.k-2, # as implemented in the paper
+            include=["embeddings", "distances"]
         )
         
         # Get the embeddings from results
@@ -922,7 +930,7 @@ class PointTransformer_PEFT(nn.Module):
         # TODO: Benchmark different pooling methods. Current one seems limiting for physics modeling.
         concat_f = torch.cat([x[:, 0], x[:, 1:].max(1)[0]], dim=-1)
         # TODO: Benchmark neural operators for better physics performance.
-        ret = self.cls_head_finetune(concat_f)
+        ret = self.finetune_head(concat_f)
         return ret
 
 def prepare_for_peft(
@@ -933,7 +941,7 @@ def prepare_for_peft(
         param.requires_grad = False
     
     # unfreeze the prompt prior
-    model.cls_head_finetune.requires_grad = True
+    model.finetune_head.requires_grad = True
     
     # unfreeze the prompt prior
     model.blocks.local_attention.requires_grad = True

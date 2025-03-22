@@ -6,8 +6,8 @@ import torch.nn as nn
 import wandb
 
 from datasets.DrivaernetDataset import get_dataloaders
-from models.Point_MAE_PEFT import Point_MAE
-from peft.cache_prompts import load_cached_data
+from models.Point_MAE_PEFT import PointTransformer_PEFT
+from peft.cache_prompts import load_encoder_model, load_cached_data
 
 
 class LossType(enum.Enum):
@@ -28,7 +28,12 @@ config = {
     "num_epochs": 10,
     "loss_type": LossType.MSE,
     "lr": 0.0001,
-    "weight_decay": 0.0001
+    "weight_decay": 0.0001,
+    "k": 10,
+    "prompt_bank": load_cached_data(),
+    "prompt_encoder": load_encoder_model(),
+    "early_stop_patience": 5,
+    "checkpoint_every": 1
 }
 
 def get_loss_fn(loss_type: LossType):
@@ -47,12 +52,8 @@ def get_scheduler(optimizer: torch.optim.Optimizer, num_epochs: int):
     return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
 
 def process_batch(batch):
-    # TODO: Implement batch processing logic
-    # Should extract point cloud data and target values from batch
-    # Format points into proper tensor shape for model input
-    # Normalize/preprocess as needed
-    # Return tuple of (points, target) tensors
-    return "pts", "target"
+    points = batch["points"]
+    return points[:, :, :3], points[:, :, 3]
 
 def finetune_point_mae_peft(
     config: dict
@@ -62,8 +63,13 @@ def finetune_point_mae_peft(
         batch_size=config["batch_size"],
         num_workers=config["num_workers"]
     )
-    
-    model = Point_MAE.load_model_from_ckpt(config["model_path"])
+    model = PointTransformer_PEFT(
+        config=config, 
+        embedding_model=load_encoder_model(),
+        k=config["k"],
+        prompt_bank=config["prompt_bank"],
+        prompt_encoder=config["prompt_encoder"]
+    )
     model = model.to(config["device"])
     model.prepare_for_peft()
 
@@ -86,7 +92,7 @@ def finetune_point_mae_peft(
     checkpoint_dir = os.path.join(config["output_path"]+f"/{config['wandb_name']}", "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     best_val_loss = float('inf')
-    early_stop_patience = config.get("early_stop_patience", 5)
+    early_stop_patience = config["early_stop_patience"]
     epochs_no_improve = 0
 
     for epoch in range(config["num_epochs"]):
