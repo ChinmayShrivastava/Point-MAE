@@ -13,3 +13,7 @@ tqdm
 transforms3d
 termcolor
 chromadb
+wandb
+kaggle
+posthog==2.4.0
+pyyaml

@@ -580,10 +580,10 @@ class MaskTransformer(nn.Module):
 
 
 @MODELS.register_module()
-class Point_MAE(nn.Module):
+class Point_MAE_PEFT(nn.Module):
     def __init__(self, config):
         super().__init__()
-        print_log(f'[Point_MAE] ', logger ='Point_MAE')
+        print_log(f'[Point_MAE_PEFT] ', logger='Point_MAE_PEFT')
         self.config = config
         self.trans_dim = config.transformer_config.trans_dim
         self.MAE_encoder = MaskTransformer(config)
@@ -607,7 +607,7 @@ class Point_MAE(nn.Module):
             num_heads=self.decoder_num_heads,
         )
 
-        print_log(f'[Point_MAE] divide point cloud into G{self.num_group} x S{self.group_size} points ...', logger ='Point_MAE')
+        print_log(f'[Point_MAE_PEFT] divide point cloud into G{self.num_group} x S{self.group_size} points ...', logger ='Point_MAE_PEFT')
         self.group_divider = Group(num_group = self.num_group, group_size = self.group_size)
 
         # prediction head
@@ -688,7 +688,7 @@ class Point_MAE(nn.Module):
 
 # finetune model
 @MODELS.register_module()
-class PointTransformer(nn.Module):
+class PointTransformer_PEFT(nn.Module):
     def __init__(
         self, 
         config, 
@@ -926,7 +926,7 @@ class PointTransformer(nn.Module):
         return ret
 
 def prepare_for_peft(
-    model: PointTransformer
+    model: PointTransformer_PEFT
 ):
     # freeze all parameters
     for param in model.parameters():

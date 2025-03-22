@@ -69,11 +69,16 @@ class Group(nn.Module):  # FPS + KNN
         _, idx = self.knn(xyz, center) # B G M
         assert idx.size(1) == self.num_group
         assert idx.size(2) == self.group_size
+
+        # Fix: Reshape the index tensor properly
         idx_base = torch.arange(0, batch_size, device=xyz.device).view(-1, 1, 1) * num_points
         idx = idx + idx_base
         idx = idx.view(-1)
+
+        # Fix: Properly reshape the neighborhood tensor
         neighborhood = xyz.view(batch_size * num_points, -1)[idx, :]
-        neighborhood = neighborhood.view(batch_size, self.num_group, self.group_size, 3).contiguous()
+        neighborhood = neighborhood.view(batch_size, self.num_group, self.group_size, 3)
+
         # normalize
         neighborhood = neighborhood - center.unsqueeze(2)
         return neighborhood, center
@@ -368,6 +373,22 @@ class Point_MAE(nn.Module):
         self.loss = config.loss
         # loss
         self.build_loss_func(self.loss)
+        
+    def encode_pts(self, pts):
+        """
+        Encode the point cloud into a set of tokens.
+        
+        Args:
+            pts: B N 3
+        Returns:
+            x_vis: B C
+        """
+        neighborhood, center = self.group_divider(pts)
+        x_vis, _ = self.MAE_encoder(neighborhood, center)
+        # perform max pooling over the group size so that the output is B C
+        # TODO: Benchmark different pooling methods. Current one might be limiting for physics modeling.
+        x_vis = torch.max(x_vis, dim=2)[0]
+        return x_vis
 
     def build_loss_func(self, loss_type):
         if loss_type == "cdl1":

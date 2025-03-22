@@ -20,7 +20,7 @@ config = {
     "num_workers": 4,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "model_path": "models/Point_MAE_PEFT.py",
-    "output_path": "data/peft_cache",
+    "output_path": "data/",
     "data_path": "data/drivaernet_db.sqlite",
     "wandb_project": "drivaernet-peft",
     "wandb_entity": "drivaernet",
@@ -45,6 +45,14 @@ def get_optimizer(model: nn.Module, lr: float, weight_decay: float):
     
 def get_scheduler(optimizer: torch.optim.Optimizer, num_epochs: int):
     return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+
+def process_batch(batch):
+    # TODO: Implement batch processing logic
+    # Should extract point cloud data and target values from batch
+    # Format points into proper tensor shape for model input
+    # Normalize/preprocess as needed
+    # Return tuple of (points, target) tensors
+    return "pts", "target"
 
 def finetune_point_mae_peft(
     config: dict
@@ -75,7 +83,7 @@ def finetune_point_mae_peft(
     scheduler = get_scheduler(optimizer, config["num_epochs"])
 
     # Create checkpoint directory
-    checkpoint_dir = os.path.join(config["output_path"], "checkpoints")
+    checkpoint_dir = os.path.join(config["output_path"]+f"/{config['wandb_name']}", "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
     best_val_loss = float('inf')
     early_stop_patience = config.get("early_stop_patience", 5)
@@ -87,7 +95,7 @@ def finetune_point_mae_peft(
         total_train_loss = 0
         for batch_idx, batch in enumerate(train_loader):
             # Get data and move to device
-            pts, target = batch
+            pts, target = process_batch(batch)
             pts = pts.to(config["device"])
             target = target.to(config["device"])
             
@@ -117,7 +125,7 @@ def finetune_point_mae_peft(
         total_val_loss = 0
         with torch.no_grad():
             for batch_idx, batch in enumerate(val_loader):
-                pts, target = batch
+                pts, target = process_batch(batch)
                 pts = pts.to(config["device"])
                 target = target.to(config["device"])
                 
@@ -143,7 +151,7 @@ def finetune_point_mae_peft(
         total_test_loss = 0
         with torch.no_grad():
             for batch_idx, batch in enumerate(test_loader):
-                pts, target = batch
+                pts, target = process_batch(batch)
                 pts = pts.to(config["device"]) 
                 target = target.to(config["device"])
                 

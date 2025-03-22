@@ -11,7 +11,7 @@ class DrivAerNetSQLDataset(Dataset):
     def __init__(
         self, 
         db_path: str,
-        num_points: int = 8192
+        num_points: int = 1024
     ):
         """
         Args:
@@ -51,15 +51,15 @@ class DrivAerNetSQLDataset(Dataset):
         # Make array writable and convert to correct shape
         point_cloud_array = point_cloud_array.copy()  # Make writable
         
-        # # Sample num_points if less than total available points
-        # if self.num_points < 8192:
-        #     # Randomly sample indices without replacement
-        #     sample_indices = np.random.choice(8192, self.num_points, replace=False)
-        #     point_cloud_array = point_cloud_array[sample_indices]
+        # Sample num_points if less than total available points
+        if self.num_points < 8192:
+            # Randomly sample indices without replacement
+            sample_indices = np.random.choice(8192, self.num_points, replace=False)
+            point_cloud_array = point_cloud_array[sample_indices]
         
-        point_cloud = torch.from_numpy(point_cloud_array).permute(1, 0)  # Shape: (4, num_points)
+        # point_cloud = torch.from_numpy(point_cloud_array).permute(1, 0)  # Shape: (4, num_points)
         
-        return point_cloud
+        return point_cloud_array # Shape: (num_points, 4)
     
 def get_dataloaders(
     db_path: str,
@@ -79,9 +79,9 @@ def get_dataloaders(
     """
     full_dataset = DrivAerNetSQLDataset(db_path=db_path)
     
-    train_ids = pd.read_csv('train_design_ids.txt', header=None).values.flatten()
-    val_ids = pd.read_csv('val_design_ids.txt', header=None).values.flatten()
-    test_ids = pd.read_csv('test_design_ids.txt', header=None).values.flatten()
+    train_ids = pd.read_csv('train_val_test_splits/train_design_ids.txt', header=None).values.flatten()
+    val_ids = pd.read_csv('train_val_test_splits/val_design_ids.txt', header=None).values.flatten()
+    test_ids = pd.read_csv('train_val_test_splits/test_design_ids.txt', header=None).values.flatten()
     
     train_dataset = Subset(full_dataset, train_ids)
     val_dataset = Subset(full_dataset, val_ids)

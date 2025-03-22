@@ -1,14 +1,16 @@
 import os
 from typing import List, Union
 
+import easydict
 import numpy as np
 import torch
+import yaml
 from chromadb import Collection, PersistentClient
 from tqdm import tqdm
 
-from datasets.DrivaernetDataset import DrivaernetDataset, get_dataloaders
+from datasets.DrivaernetDataset import get_dataloaders
 from models.Point_MAE import Point_MAE
-from models.Point_MAE_PEFT import PointTransformer
+from tools import builder
 
 # class PointMAEEmbeddingFunction(EmbeddingFunction):
 #     def __init__(self, model: Point_MAE): self.model = model
@@ -28,7 +30,8 @@ def cache_encoded_data(
     model_path, 
     output_path, 
     device='cuda',
-    collection_name='encoded_data'
+    collection_name='encoded_data',
+    config_path='cfgs/pretrain.yaml'
 ):
     """
     Load pretrained PointTransformer model and encode data from dataloader.
@@ -40,21 +43,38 @@ def cache_encoded_data(
         output_path: Path to save encoded data
         device: Device to run model on
     """
+    assert config_path is not None, "Config path is required"
+    
+    # Load config if provided
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    config = easydict.EasyDict(config['model'])  # Directly convert model config section to EasyDict
+    
+    if config is None:
+        raise ValueError("Config is None")
+    
     # Check if data is already cached
-    client = PersistentClient(path=output_path)
+    client = PersistentClient(
+        path=output_path
+    )
     try:
         collection = client.get_collection(collection_name)
         count = collection.count()
         print(f"Found existing cached data with {count} entries at {output_path}")
         return collection
-    except ValueError:
+    except:
         # Collection doesn't exist, proceed with caching
-        collection = client.create_collection(collection_name)
+        collection = client.create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"}
+        )
 
     # Load pretrained model
-    model = Point_MAE(config=None)  # Config will be loaded from checkpoint
-    checkpoint = torch.load(model_path, map_location=device)
-    model.load_state_dict(checkpoint['model'])
+    model = Point_MAE(config=config)  # Config will be loaded from checkpoint
+    builder.load_model(model, ckpt_path=model_path)
+    # checkpoint = torch.load(model_path, map_location=device)
+    # model.load_model_from_ckpt(model_path)
+    
     model = model.to(device)
     model.eval()
     
@@ -69,7 +89,7 @@ def cache_encoded_data(
             points = batch.to(device)
             
             # Encode points
-            encoded = model.encode_pts(points)
+            encoded = model.encode_pts(points[:, :, :3].contiguous()) # this takes in B N 3
             
             # Convert to numpy and add to ChromaDB
             embeddings = encoded.cpu().numpy()
@@ -128,11 +148,6 @@ def main(
 
     # Create output directory if it doesn't exist
     os.makedirs(output_path, exist_ok=True)
-
-    # Load model
-    model = PointTransformer.load_from_checkpoint(model_path)
-    model = model.to(device)
-    model.eval()
 
     # Initialize dataset and dataloader
     # Note: Modify this according to your specific dataset class
