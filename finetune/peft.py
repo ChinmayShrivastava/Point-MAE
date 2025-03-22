@@ -14,9 +14,10 @@ class LossType(enum.Enum):
     MSE = "mse"
     L1 = "l1"
     L2 = "l2"
+    SMOOTH_L1 = "smooth_l1"
 
 config = {
-    "batch_size": 16,
+    "batch_size": 4,
     "num_workers": 4,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "model_path": "models/Point_MAE_PEFT.py",
@@ -25,15 +26,15 @@ config = {
     "wandb_project": "drivaernet-peft",
     "wandb_entity": "drivaernet",
     "wandb_name": "point-mae-peft",
-    "num_epochs": 10,
-    "loss_type": LossType.MSE,
-    "lr": 0.0001,
-    "weight_decay": 0.0001,
+    "num_epochs": 100,
+    "loss_type": LossType.SMOOTH_L1,
+    "lr": 0.0005,
+    "weight_decay": 0.05,
     "k": 10,
     "prompt_bank": load_cached_data(),
     "prompt_encoder": load_encoder_model(),
-    "early_stop_patience": 5,
-    "checkpoint_every": 1
+    "early_stop_patience": 20,
+    "checkpoint_every": 5
 }
 
 def get_loss_fn(loss_type: LossType):
@@ -48,8 +49,8 @@ def get_optimizer(model: nn.Module, lr: float, weight_decay: float):
     return torch.optim.Adam(
         model.parameters(), lr=lr, weight_decay=weight_decay)
     
-def get_scheduler(optimizer: torch.optim.Optimizer, num_epochs: int):
-    return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+def get_scheduler(optimizer: torch.optim.Optimizer, num_epochs: int, eta_min: float = 0.000001):
+    return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=eta_min)
 
 def process_batch(batch):
     points = batch["points"]
